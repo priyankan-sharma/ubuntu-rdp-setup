@@ -4,7 +4,7 @@
 #  One-shot installer: Ubuntu 24.04 LTS server  ->  RDP-accessible desktop
 #                                                   with Google Chrome.
 # =============================================================================
-#  SCRIPT_VERSION : 1.3.0
+#  SCRIPT_VERSION : 1.4.0
 #  TARGET OS      : Ubuntu 24.04 LTS (noble), amd64 or arm64
 #  TARGET HW      : VPS, 1-4 vCPU / 1-16 GB RAM
 #  LICENSE        : MIT
@@ -73,6 +73,13 @@
 # =============================================================================
 #  CHANGELOG
 # -----------------------------------------------------------------------------
+#  1.4.0  FIX: Indian-language text rendered as empty boxes ("tofu").
+#         A server image ships Latin fonts only - measured on a fresh install,
+#         fc-list :lang=hi returned 0, so google.com's own language footer was
+#         unreadable. Stage 04 now installs fonts-indic (all 14 Indian scripts),
+#         fonts-noto-core and fonts-noto-color-emoji, then rebuilds the font
+#         cache. Adds ~200 MB. Three verification checks added.
+#
 #  1.3.0  CRITICAL FIX: the reaper was killing LIVE desktop sessions.
 #         Also: system timezone is now set to Asia/Kolkata by default (VPS
 #         images ship as UTC) and NTP is enabled. Override with
@@ -137,7 +144,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.4.0"
 readonly STATE_DIR="/var/lib/xrdp-setup"
 readonly STATE_FILE="${STATE_DIR}/state"
 readonly LOG_FILE="/var/log/xrdp-setup.log"
@@ -602,8 +609,24 @@ stage_04_install_de() {
 
   # Common bits every DE needs under XRDP.
   local common=(xorg xserver-xorg-core dbus-x11 x11-xserver-utils x11-utils
-                policykit-1-gnome fonts-dejavu-core fonts-liberation
-                desktop-file-utils xdg-utils)
+                policykit-1-gnome desktop-file-utils xdg-utils fontconfig)
+
+  # ---------------------------------------------------------------------------
+  # Fonts.
+  #  WHY this is not optional: a server image carries Latin fonts only. Without
+  #  the rest, any page containing Indic, CJK or emoji text renders as rows of
+  #  empty boxes ("tofu") - google.com's own language footer does exactly that.
+  #  Measured on a fresh 24.04 + XFCE install: fc-list :lang=hi returned 0.
+  #    fonts-indic           all 14 Indian scripts (Devanagari, Bengali, Tamil,
+  #                          Telugu, Kannada, Malayalam, Gujarati, Gurmukhi,
+  #                          Odia, Assamese and friends) - about 200 MB
+  #    fonts-noto-core       broad Unicode coverage for everything else
+  #    fonts-noto-color-emoji  emoji, which are everywhere on the modern web
+  #  CJK is deliberately excluded (fonts-noto-cjk is ~250 MB); add it by hand if
+  #  you browse Chinese/Japanese/Korean sites.
+  # ---------------------------------------------------------------------------
+  local fonts=(fonts-dejavu-core fonts-dejavu-extra fonts-liberation
+               fonts-indic fonts-noto-core fonts-noto-color-emoji)
 
   local pkgs=()
   case "$DE_CHOICE" in
@@ -627,6 +650,11 @@ stage_04_install_de() {
 
   info "Installing X11 base ..."
   apt_install "${common[@]}"
+
+  info "Installing fonts (Latin + all Indian scripts + Noto + emoji) ..."
+  apt_install "${fonts[@]}"
+  # fontconfig only sees new fonts after its cache is rebuilt.
+  run fc-cache -f >/dev/null 2>&1 || true
 
   info "Installing ${DE_CHOICE^^} (this is the long one) ..."
   apt_install "${pkgs[@]}"
@@ -1710,6 +1738,10 @@ stage_10_verify() {
   check "TLS certificate is readable by xrdp"      sudo -u xrdp test -r /etc/xrdp/key.pem
   check "user '${RDP_USER}' exists"                id -u "$RDP_USER"
   check "startwm.sh is executable"                 test -x /etc/xrdp/startwm.sh
+  # Font coverage: 0 here means every Indic page renders as empty boxes.
+  check "Devanagari fonts present"                 bash -c "[[ \$(fc-list :lang=hi | wc -l) -gt 0 ]]"
+  check "Tamil fonts present"                      bash -c "[[ \$(fc-list :lang=ta | wc -l) -gt 0 ]]"
+  check "emoji font present"                       bash -c "[[ \$(fc-list :lang=und-zsye | wc -l) -gt 0 ]]"
   if [[ "$TIMEZONE" != "keep" ]]; then
     check "timezone is ${TIMEZONE}"                 bash -c "[[ \"\$(timedatectl show -p Timezone --value)\" == \"${TIMEZONE}\" ]]"
   fi

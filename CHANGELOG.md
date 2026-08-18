@@ -5,6 +5,28 @@ comment block in the script header — keep both in sync when releasing.
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Versioning: [SemVer](https://semver.org/).
 
+## [1.4.0] - 2026-08-19
+
+### Fixed
+- **Indian-language text rendered as empty boxes ("tofu").** A server image
+  carries Latin fonts only, and stage 04 installed just `fonts-dejavu-core` and
+  `fonts-liberation`. Measured on a completed install: `fc-list :lang=hi`, `:ta`,
+  `:te` and `:bn` all returned **0** — google.com's own language footer was
+  unreadable.
+
+### Changed
+- Stage 04 now installs a proper font set and rebuilds the fontconfig cache:
+  `fonts-indic` (all 14 Indian scripts — Devanagari, Bengali, Tamil, Telugu,
+  Kannada, Malayalam, Gujarati, Gurmukhi, Odia, Assamese and others),
+  `fonts-noto-core` for broad Unicode coverage, `fonts-noto-color-emoji`, plus
+  `fonts-dejavu-extra` and `fontconfig` itself. Costs about 200 MB.
+- CJK (`fonts-noto-cjk`, ~250 MB) is deliberately left out; install it by hand if
+  you browse Chinese/Japanese/Korean sites.
+
+### Added
+- Three verification checks in stage 10 for Devanagari, Tamil and emoji coverage,
+  so a font-less install cannot report success.
+
 ## [1.3.0] - 2026-08-19
 
 ### Fixed
