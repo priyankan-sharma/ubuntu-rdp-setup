@@ -4,7 +4,7 @@
 #  One-shot installer: Ubuntu 24.04 LTS server  ->  RDP-accessible desktop
 #                                                   with Google Chrome.
 # =============================================================================
-#  SCRIPT_VERSION : 1.2.0
+#  SCRIPT_VERSION : 1.3.0
 #  TARGET OS      : Ubuntu 24.04 LTS (noble), amd64 or arm64
 #  TARGET HW      : VPS, 1-4 vCPU / 1-16 GB RAM
 #  LICENSE        : MIT
@@ -63,6 +63,8 @@
 #  FLAGS:
 #      --dry-run              print what would happen, change nothing
 #      --de=xfce|mate|gnome   skip the DE prompt
+#      --timezone=ZONE        IANA zone to set (default Asia/Kolkata);
+#                             use --timezone=keep to leave it untouched
 #      --skip-upgrade         skip stage 01 (faster re-runs)
 #      --force                ignore the state file, re-run every stage
 #      --version              print version and exit
@@ -71,6 +73,27 @@
 # =============================================================================
 #  CHANGELOG
 # -----------------------------------------------------------------------------
+#  1.3.0  CRITICAL FIX: the reaper was killing LIVE desktop sessions.
+#         Also: system timezone is now set to Asia/Kolkata by default (VPS
+#         images ship as UTC) and NTP is enabled. Override with
+#         --timezone=<zone> or --timezone=keep.
+#         Cause: reaper 1.0.0 decided "is a client attached?" by correlating
+#         ESTABLISHED TCP connections on 3389 back to an X display via the
+#         connection process cmdline, its children, and its environ. Measured on
+#         a live session, ALL THREE are empty - the xrdp connection process has
+#         cmdline "/usr/sbin/xrdp", no children, and no DISPLAY. So every live
+#         session looked clientless and was killed 120s after login, taking the
+#         browser and any unsaved work with it.
+#         Fix: reaper 1.1.0 uses the process tree instead. A live session has its
+#         Xorg parented to a per-session xrdp-sesman; an orphan is reparented to
+#         PID 1. Disconnect handling is now left entirely to sesman
+#         (KillDisconnected=true), which is the mechanism designed for it. The
+#         reaper only handles what sesman cannot: orphaned processes, on-disk
+#         debris, and a dead listener. Added --status for a no-op snapshot.
+#         Also: startwm.sh no longer deletes ~/.cache/sessions on every login
+#         (that cleanup moved to boot only), and the pointless
+#         GNOME_SHELL_SESSION_MODE export was dropped from ~/.xsessionrc.
+#
 #  1.2.0  FIX: blue/blank login screen with no username-password box.
 #         Cause: 1.0.0-1.1.0 wrote /etc/xrdp/xrdp.ini from scratch and defined
 #         only two ls_* keys (ls_title, ls_top_window_bg_color). xrdp draws its
@@ -114,7 +137,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.3.0"
 readonly STATE_DIR="/var/lib/xrdp-setup"
 readonly STATE_FILE="${STATE_DIR}/state"
 readonly LOG_FILE="/var/log/xrdp-setup.log"
@@ -127,6 +150,11 @@ DRY_RUN=0
 FORCE=0
 SKIP_UPGRADE=0
 DE_CHOICE=""          # xfce | mate | gnome  (empty => prompt)
+# WHY Asia/Kolkata: these servers are operated from India, and a VPS image
+# defaults to UTC. Logs, cron, file timestamps and the desktop clock all being
+# 5h30m off local time is a constant low-grade nuisance. Override with
+# --timezone=<IANA zone>, or "--timezone=keep" to leave the image as-is.
+TIMEZONE="Asia/Kolkata"
 
 # ---- collected during the run ----------------------------------------------
 RDP_USER=""
@@ -353,9 +381,8 @@ stage_01_update() {
   step "Stage 01/10 - Updating and upgrading all packages"
 
   if [[ $SKIP_UPGRADE -eq 1 ]]; then
-    warn "--skip-upgrade given; skipping dist-upgrade"
-    return 0
-  fi
+    warn "--skip-upgrade given; skipping dist-upgrade (timezone is still applied)"
+  else
 
   info "apt-get update ..."
   apt_retry update || die "apt-get update failed"
@@ -368,6 +395,38 @@ stage_01_update() {
   info "Removing obsolete packages ..."
   apt_retry autoremove -y  || true
   apt_retry autoclean -y   || true
+  fi   # end of the --skip-upgrade guard
+
+  # ---------------------------------------------------------------------------
+  # Timezone + time sync.
+  #  WHY here: it must happen before anything writes timestamped logs, and before
+  #  the desktop is installed, so the clock the user sees is right from the very
+  #  first login. A VPS image ships as UTC; these servers are run from India.
+  #  WHY NTP too: a VPS clock drifts, and a skewed clock breaks TLS certificate
+  #  validation in the browser - which looks like "random HTTPS errors", not like
+  #  a clock problem.
+  # ---------------------------------------------------------------------------
+  if [[ "$TIMEZONE" == "keep" ]]; then
+    info "Leaving the system timezone as-is (--timezone=keep)"
+  else
+    if [[ ! -f "/usr/share/zoneinfo/${TIMEZONE}" ]]; then
+      warn "Unknown timezone '${TIMEZONE}'; leaving the system clock alone."
+      warn "List valid zones with: timedatectl list-timezones"
+    else
+      local current_tz
+      current_tz="$(timedatectl show -p Timezone --value 2>/dev/null || echo unknown)"
+      if [[ "$current_tz" == "$TIMEZONE" ]]; then
+        info "Timezone already ${TIMEZONE}"
+      else
+        info "Setting timezone: ${current_tz} -> ${TIMEZONE}"
+        run timedatectl set-timezone "$TIMEZONE" \
+          || warn "timedatectl failed; timezone unchanged"
+      fi
+    fi
+    # Keep the clock accurate. systemd-timesyncd ships with Ubuntu Server.
+    run timedatectl set-ntp true 2>/dev/null || true
+    info "Clock now: $(date '+%Y-%m-%d %H:%M:%S %Z (%z)')"
+  fi
 
   # A kernel/libc upgrade may want a reboot. Note it; do not force one, because
   # rebooting mid-script would lose the operator's terminal.
@@ -825,9 +884,11 @@ if [ -f "$HOME/.xsession-errors" ] && [ "$(stat -c %s "$HOME/.xsession-errors" 2
   : > "$HOME/.xsession-errors"
 fi
 
-# 5. Remove stale saved-session state. A saved session that references a dead
-#    display is itself a black-screen cause on XFCE and MATE.
-rm -rf "$HOME/.cache/sessions" 2>/dev/null || true
+# 5. NOTE (v1.3.0): this used to "rm -rf $HOME/.cache/sessions" on every login.
+#    That does prevent a stale saved session from black-screening a login, but it
+#    also means the desktop can NEVER restore a saved session, on every single
+#    login, forever - too high a price for a rare failure. The cleanup now runs
+#    only at boot, from xrdp-boot-cleanup.service, where no session can be live.
 
 # 6. Standard Debian/Ubuntu session startup. ~/.xsessionrc (written by the
 #    installer) selects the desktop.
@@ -873,7 +934,6 @@ RECONNECTWM
 export XDG_SESSION_DESKTOP=${DE_CHOICE}
 export XDG_CURRENT_DESKTOP=${DE_CHOICE^^}
 export XDG_SESSION_TYPE=x11
-export GNOME_SHELL_SESSION_MODE=${DE_CHOICE}
 XSESSIONRC
     cat > "${home}/.xsession" <<XSESSION
 #!/bin/sh
@@ -1093,64 +1153,85 @@ stage_08_reaper() {
 #!/usr/bin/env bash
 # =============================================================================
 #  /usr/local/sbin/xrdp-session-reaper
-#  Managed by ubuntu-rdp-setup.sh  --  reaper version 1.0.0
+#  Managed by ubuntu-rdp-setup.sh  --  reaper version 1.1.0
 # =============================================================================
 #
 #  PURPOSE
-#    Garbage-collect XRDP sessions whose RDP client is gone, plus the on-disk
-#    debris those sessions leave behind. Without this, the next login gets a
-#    black screen or an RDP window that closes seconds after authenticating.
+#    Garbage-collect XRDP sessions that are genuinely orphaned, plus the on-disk
+#    debris they leave behind. Without this, the next login gets a black screen
+#    or an RDP window that closes seconds after authenticating.
+#
+#  ---------------------------------------------------------------------------
+#  HARD-WON LESSON (reaper 1.1.0) - READ BEFORE CHANGING THE DETECTION LOGIC
+#  ---------------------------------------------------------------------------
+#  Reaper 1.0.0 tried to decide whether a client was attached by correlating
+#  ESTABLISHED TCP connections on port 3389 back to an X display, via the
+#  connection process cmdline, its children, and its environment.
+#
+#  ALL THREE OF THOSE SOURCES ARE EMPTY. Measured on Ubuntu 24.04, xrdp 0.9.24,
+#  on a live, actively-used session:
+#      pid 55464: cmdline "/usr/sbin/xrdp"   <- no display anywhere
+#                 children: (none)
+#                 DISPLAY in environ: NONE
+#                 fds referencing X sockets: 0
+#  So attached_displays() always returned an empty set, EVERY live session
+#  looked clientless, and the reaper killed working desktops 120 seconds after
+#  login - taking the user's browser and unsaved work with it. That is far worse
+#  than the problem the reaper exists to solve.
+#
+#  THE CORRECT SIGNAL is the process tree. A live session looks like this:
+#      52171     1  /usr/sbin/xrdp-sesman         <- master sesman
+#      55484 52171  /usr/sbin/xrdp-sesman         <- per-session leader
+#      55486 55484  /usr/lib/xorg/Xorg :10 ...    <- child of the leader
+#      55491 55484  /usr/sbin/xrdp-chansrv        <- child of the leader
+#  While a session is alive, sesman keeps a per-session process as the parent of
+#  that display's Xorg. If that parent dies without cleaning up, Xorg is
+#  reparented to PID 1 - and THAT is an orphan worth reaping.
+#
+#  DESIGN RULE ADOPTED IN 1.1.0: the reaper does not try to out-guess sesman
+#  about who is connected. Disconnect handling belongs to sesman, which already
+#  does it via KillDisconnected=true + DisconnectedTimeLimit=60 in sesman.ini.
+#  The reaper handles only what sesman cannot: processes it has lost track of,
+#  leftover debris, and a dead listener. It is deliberately conservative - a
+#  missed zombie costs one manual cleanup, a wrongly-killed session costs the
+#  user their work.
 #
 #  ALGORITHM (one pass; the timer runs it every 60 seconds)
-#    1. Enumerate candidate session displays from three independent sources, so
-#       a session is still found even if one source is inconsistent:
-#         a) running "Xorg :NN" / "Xvnc :NN" processes
-#         b) /tmp/.X11-unix/X<NN> sockets
-#         c) running xrdp-chansrv processes (they carry the display in argv)
-#       Only displays >= X11DisplayOffset (10) are considered, so a physical
-#       console :0 is never touched.
-#    2. Decide whether a real client is attached to each display:
-#         - collect the PIDs of every xrdp process holding an ESTABLISHED TCP
-#           connection on port 3389 (ss -tnp)
-#         - walk each such PID's process tree to find its session leader and the
-#           display it serves
-#       A display with at least one attached client is LIVE. Otherwise it is a
-#       candidate zombie.
-#    3. Grace period. A display that has just been created but not yet attached
-#       (login in progress) must not be killed. We record the first time each
-#       display was seen clientless in /run/xrdp-reaper/<display>.since and only
-#       reap once GRACE_SECONDS have passed (default 120).
-#    4. Reap: SIGTERM the whole tree (Xorg/Xvnc, xrdp-chansrv, xrdp-sessvc, the
-#       session dbus-daemon, the DE processes owning that DISPLAY), wait, then
-#       SIGKILL whatever survived.
-#    5. Clean the debris that actually causes the black screen:
-#         /tmp/.X11-unix/X<NN>, /tmp/.X<NN>-lock,
-#         /tmp/.xrdp/xrdp_chansrv_socket_<NN>*, /tmp/.xrdp/xrdp_display_<NN>*,
-#         stale ~/.Xauthority entries, oversized ~/.xsession-errors,
-#         ~/.cache/sessions (stale saved sessions are a black-screen cause).
+#    1. Enumerate candidate displays >= X11DisplayOffset (10) from running
+#       Xorg/Xvnc processes and /tmp/.X11-unix sockets. :0 is never touched.
+#    2. For each display, find its X server process and look at the PARENT:
+#         - parent is a live xrdp-sesman/xrdp-sessvc  -> LIVE, never touched
+#         - parent is PID 1 (orphaned)                -> candidate zombie
+#         - no X server process at all                -> debris only, clean it
+#    3. Grace period: an orphan must stay orphaned for GRACE_SECONDS (default
+#       120) across consecutive sweeps before it is reaped. This avoids racing
+#       sesman during its own teardown, and avoids reaping a session that is
+#       mid-startup.
+#    4. Reap: SIGTERM the session process tree, wait, SIGKILL survivors.
+#    5. Clean the debris that actually causes the black screen: X11 sockets,
+#       X locks, xrdp chansrv sockets, oversized ~/.xsession-errors, corrupt
+#       ~/.Xauthority.
 #    6. Self-heal: if nothing is listening on 3389, or xrdp/xrdp-sesman is in a
 #       failed state, restart them.
 #
-#  SAFETY RULES (important for anyone editing this)
+#  SAFETY RULES (do not weaken these)
 #    - Never touch display :0 or any display below X11DisplayOffset.
-#    - Never kill a PID that is not owned by a normal user (uid >= 1000) or by
-#      the xrdp service user.
-#    - Never kill PID 1, sshd, or anything outside the identified session tree.
+#    - Never kill an X server whose parent is a live sesman process.
+#    - Never kill PID 1, or any process not owned by a normal user (uid >= 1000)
+#      or the xrdp service user.
 #    - Every destructive action is logged to /var/log/xrdp-reaper.log.
 #
 #  FLAGS
-#    --dry-run   report what would be killed/removed; change nothing
-#    --verbose   log LIVE sessions too, not just actions
-#    --cleanup-only
-#                skip the reaping logic and only remove orphaned debris.
-#                This is the mode used by xrdp-boot-cleanup.service (layer 4),
-#                where by definition nothing is running yet.
-#    --grace=N   override the grace period in seconds (default 120)
+#    --dry-run       report what would be killed/removed; change nothing
+#    --verbose       log LIVE sessions too, not just actions
+#    --cleanup-only  only remove orphaned debris; used by the boot cleanup unit
+#    --grace=N       override the grace period in seconds (default 120)
+#    --status        print a one-shot view of every display and its verdict
 # =============================================================================
 
 set -uo pipefail   # NOT -e: a single failed probe must never abort a sweep.
 
-REAPER_VERSION="1.0.0"
+REAPER_VERSION="1.1.0"
 LOG=/var/log/xrdp-reaper.log
 STATE=/run/xrdp-reaper
 GRACE_SECONDS=120
@@ -1158,22 +1239,24 @@ DISPLAY_OFFSET=10
 DRY=0
 VERBOSE=0
 CLEANUP_ONLY=0
+STATUS_ONLY=0
 
 for arg in "$@"; do
   case "$arg" in
     --dry-run)      DRY=1 ;;
     --verbose)      VERBOSE=1 ;;
     --cleanup-only) CLEANUP_ONLY=1 ;;
+    --status)       STATUS_ONLY=1 ;;
     --grace=*)      GRACE_SECONDS="${arg#*=}" ;;
     --version)      echo "xrdp-session-reaper ${REAPER_VERSION}"; exit 0 ;;
-    -h|--help)      sed -n '2,70p' "$0"; exit 0 ;;
+    -h|--help)      sed -n '2,90p' "$0"; exit 0 ;;
     *)              echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
 
 mkdir -p "$STATE"
 log() { printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >>"$LOG"; }
-act() { # act <description> <command...>
+act() {
   local desc="$1"; shift
   if [[ $DRY -eq 1 ]]; then log DRYRUN "$desc"; return 0; fi
   log ACTION "$desc"
@@ -1181,96 +1264,96 @@ act() { # act <description> <command...>
 }
 
 # ---------------------------------------------------------------------------
-# discover_displays -- prints candidate display numbers, one per line
+# discover_displays -- candidate display numbers, one per line
 # ---------------------------------------------------------------------------
 discover_displays() {
   {
-    # a) X servers started by xrdp
     ps -eo args= 2>/dev/null \
       | grep -Eo '(^|/)(Xorg|Xvnc)[[:space:]]+:[0-9]+' \
       | grep -Eo ':[0-9]+' | tr -d ':'
-    # b) X11 sockets
     for s in /tmp/.X11-unix/X*; do
       [[ -e "$s" ]] || continue
       echo "${s##*/X}"
     done
-    # c) chansrv processes carry the display in their arguments
-    ps -eo args= 2>/dev/null \
-      | grep 'xrdp-chansrv' \
-      | grep -Eo '\-\-display[[:space:]]*:?[0-9]+|:[0-9]+' \
-      | grep -Eo '[0-9]+'
   } 2>/dev/null | grep -E '^[0-9]+$' | sort -un | awk -v off="$DISPLAY_OFFSET" '$1 >= off'
 }
 
 # ---------------------------------------------------------------------------
-# attached_displays -- prints display numbers that currently have a live client
-#
-# We take every xrdp PID with an ESTABLISHED socket on 3389, then map it to a
-# display by inspecting its own argv and its children's argv.
+# xserver_pid_for_display <display>  -- prints the X server PID, or nothing
 # ---------------------------------------------------------------------------
-attached_displays() {
-  local pids pid kid
-  pids=$(ss -tnpH state established '( sport = :3389 )' 2>/dev/null \
-         | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u)
-  [[ -z "$pids" ]] && return 0
-  for pid in $pids; do
-    [[ -d "/proc/$pid" ]] || continue
-    # The xrdp front-end process and everything under it.
-    {
-      tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null
-      for kid in $(pgrep -P "$pid" 2>/dev/null); do
-        tr '\0' ' ' < "/proc/$kid/cmdline" 2>/dev/null; echo
-        for gk in $(pgrep -P "$kid" 2>/dev/null); do
-          tr '\0' ' ' < "/proc/$gk/cmdline" 2>/dev/null; echo
-        done
-      done
-      # xrdp records the display in its own log line per connection; as a
-      # belt-and-braces source, read the session's environ.
-      tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^DISPLAY='
-    } 2>/dev/null | grep -Eo ':[0-9]+' | tr -d ':'
-  done | grep -E '^[0-9]+$' | sort -un
+xserver_pid_for_display() {
+  local d="$1" pid args
+  for pid in $(ps -eo pid= 2>/dev/null); do
+    args="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)"
+    case "$args" in
+      *"Xorg :${d} "*|*"Xvnc :${d} "*) echo "$pid"; return 0 ;;
+    esac
+  done
+  return 1
 }
 
 # ---------------------------------------------------------------------------
-# pids_for_display -- every process belonging to a given display
+# display_verdict <display>  -- prints LIVE | ORPHAN | EMPTY  (+ detail)
+#
+# THIS IS THE FUNCTION THAT GOT IT WRONG IN 1.0.0. It now looks only at the
+# process tree, which is the one signal that is actually present.
+# ---------------------------------------------------------------------------
+display_verdict() {
+  local d="$1" xpid ppid pcomm
+  xpid="$(xserver_pid_for_display "$d")"
+  if [[ -z "$xpid" ]]; then
+    echo "EMPTY no-x-server"
+    return 0
+  fi
+  ppid="$(awk '{print $4}' "/proc/${xpid}/stat" 2>/dev/null)"
+  if [[ -z "$ppid" ]]; then
+    echo "EMPTY x-server-vanished"
+    return 0
+  fi
+  if [[ "$ppid" -le 1 ]]; then
+    echo "ORPHAN xpid=${xpid} reparented-to-init"
+    return 0
+  fi
+  pcomm="$(cat "/proc/${ppid}/comm" 2>/dev/null || echo unknown)"
+  case "$pcomm" in
+    xrdp-sesman|xrdp-sessvc|sesman)
+      echo "LIVE xpid=${xpid} parent=${pcomm}(${ppid})" ;;
+    *)
+      # Unknown parent. Be conservative: treat as live and say so loudly, rather
+      # than risk killing a working desktop on a layout we have not seen.
+      echo "LIVE xpid=${xpid} parent=${pcomm}(${ppid}) UNRECOGNISED-PARENT" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# pids_for_display -- every process belonging to a display (used only to reap)
 # ---------------------------------------------------------------------------
 pids_for_display() {
-  local d="$1" pid uid
-  {
-    # X server for that display
-    pgrep -f "^(/usr/lib/xorg/)?Xorg :${d}\b" 2>/dev/null
-    pgrep -f "Xvnc :${d}\b" 2>/dev/null
-    # chansrv / sessvc bound to it
-    pgrep -f "xrdp-chansrv.*[: ]${d}\b" 2>/dev/null
-    # anything whose environment points at that DISPLAY
-    for pid in $(ps -eo pid= 2>/dev/null); do
-      [[ -r "/proc/$pid/environ" ]] || continue
-      if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-         | grep -qx "DISPLAY=:${d}\(\.0\)\?"; then
-        echo "$pid"
-      fi
-    done
-  } 2>/dev/null | sort -un | while read -r pid; do
+  local d="$1" pid uid xrdp_uid args
+  xrdp_uid="$(id -u xrdp 2>/dev/null || echo -1)"
+  for pid in $(ps -eo pid= 2>/dev/null); do
     [[ -z "$pid" || ! -d "/proc/$pid" ]] && continue
-    [[ "$pid" -le 1 ]] && continue                    # never PID 1
-    uid=$(awk '/^Uid:/ {print $2}' "/proc/$pid/status" 2>/dev/null)
+    [[ "$pid" -le 1 ]] && continue
+    if ! tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+         | grep -qE "^DISPLAY=:${d}(\.0)?$"; then
+      args="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)"
+      case "$args" in
+        *"Xorg :${d} "*|*"Xvnc :${d} "*) ;;
+        *) continue ;;
+      esac
+    fi
+    uid="$(awk '/^Uid:/ {print $2}' "/proc/$pid/status" 2>/dev/null)"
     [[ -z "$uid" ]] && continue
-    # Only reap processes owned by a real user or by the xrdp service user.
-    xrdp_uid="$(id -u xrdp 2>/dev/null || echo -1)"
     if [[ "$uid" -ge 1000 ]] || [[ "$uid" == "$xrdp_uid" ]]; then
       echo "$pid"
     fi
-  done
+  done | sort -un
 }
 
-# ---------------------------------------------------------------------------
-# clean_display_debris -- remove the files that cause the next login to fail
-# ---------------------------------------------------------------------------
 clean_display_debris() {
-  local d="$1"
+  local d="$1" f
   act "rm stale X11 socket /tmp/.X11-unix/X${d}"  rm -f "/tmp/.X11-unix/X${d}"
   act "rm stale X lock /tmp/.X${d}-lock"          rm -f "/tmp/.X${d}-lock"
-  local f
   for f in /tmp/.xrdp/xrdp_chansrv_socket_${d}* \
            /tmp/.xrdp/xrdp_display_${d}* \
            /tmp/.xrdp/xrdp_chansrv_audio_*_socket_${d}* ; do
@@ -1279,24 +1362,15 @@ clean_display_debris() {
   rm -f "${STATE}/${d}.since" 2>/dev/null
 }
 
-# ---------------------------------------------------------------------------
-# clean_user_debris -- per-user leftovers, applied to every non-system user
-# ---------------------------------------------------------------------------
 clean_user_debris() {
-  local user home
+  local user home uid
   while IFS=: read -r user _ uid _ _ home _; do
     [[ "$uid" -lt 1000 || "$uid" -ge 65534 ]] && continue
     [[ -d "$home" ]] || continue
-    # Oversized ~/.xsession-errors can fill / and take the box down.
     if [[ -f "${home}/.xsession-errors" ]] \
        && [[ "$(stat -c %s "${home}/.xsession-errors" 2>/dev/null || echo 0)" -gt 10485760 ]]; then
       act "truncate ${home}/.xsession-errors" truncate -s 0 "${home}/.xsession-errors"
     fi
-    # Stale saved sessions -> black screen on XFCE/MATE.
-    if [[ -d "${home}/.cache/sessions" ]] && [[ -n "$(ls -A "${home}/.cache/sessions" 2>/dev/null)" ]]; then
-      act "clear ${home}/.cache/sessions" rm -rf "${home}/.cache/sessions"
-    fi
-    # A corrupt/oversized .Xauthority makes new sessions fail to authenticate.
     if [[ -f "${home}/.Xauthority" ]] \
        && [[ "$(stat -c %s "${home}/.Xauthority" 2>/dev/null || echo 0)" -gt 32768 ]]; then
       act "reset ${home}/.Xauthority" rm -f "${home}/.Xauthority"
@@ -1304,9 +1378,8 @@ clean_user_debris() {
   done < /etc/passwd
 }
 
-# ---------------------------------------------------------------------------
-# clean_orphan_sockets -- sockets with no owning process at all
-# ---------------------------------------------------------------------------
+# Only clean saved-session state for displays with no X server: doing it while a
+# session is running would delete the live session's own state.
 clean_orphan_sockets() {
   local s d
   for s in /tmp/.X11-unix/X*; do
@@ -1314,70 +1387,44 @@ clean_orphan_sockets() {
     d="${s##*/X}"
     [[ "$d" =~ ^[0-9]+$ ]] || continue
     [[ "$d" -lt "$DISPLAY_OFFSET" ]] && continue
-    if ! pgrep -f "(Xorg|Xvnc) :${d}\b" >/dev/null 2>&1; then
+    if [[ -z "$(xserver_pid_for_display "$d")" ]]; then
       log INFO "orphan socket for :${d} (no X server) - cleaning"
       clean_display_debris "$d"
     fi
   done
-  # /tmp/.xrdp sockets whose display no longer exists
-  for s in /tmp/.xrdp/xrdp_chansrv_socket_*; do
-    [[ -e "$s" ]] || continue
-    d="${s##*_}"
-    [[ "$d" =~ ^[0-9]+$ ]] || continue
-    if ! pgrep -f "(Xorg|Xvnc) :${d}\b" >/dev/null 2>&1; then
-      act "rm orphan chansrv socket $s" rm -f "$s"
-    fi
-  done
 }
 
-# ---------------------------------------------------------------------------
-# reap_display -- terminate everything belonging to a dead session
-# ---------------------------------------------------------------------------
 reap_display() {
   local d="$1" pids pid
-  pids=$(pids_for_display "$d" | tr '\n' ' ')
+  pids="$(pids_for_display "$d" | tr '\n' ' ')"
   if [[ -z "${pids// /}" ]]; then
     log INFO "display :${d} has no processes; cleaning debris only"
     clean_display_debris "$d"
     return 0
   fi
-
-  log WARN "ZOMBIE display :${d} - no client attached for >${GRACE_SECONDS}s. Reaping PIDs: ${pids}"
-
+  log WARN "ORPHANED display :${d} (X server reparented to init) held for >${GRACE_SECONDS}s. Reaping: ${pids}"
   if [[ $DRY -eq 1 ]]; then
     log DRYRUN "would SIGTERM then SIGKILL: ${pids}"
-    log DRYRUN "would clean debris for :${d}"
     return 0
   fi
-
-  # Polite first: SIGTERM lets the DE save state and close cleanly.
   for pid in $pids; do kill -TERM "$pid" 2>/dev/null; done
   sleep 5
-  # Then force. Anything still alive after 5s is hung by definition.
   for pid in $pids; do
-    if [[ -d "/proc/$pid" ]]; then
-      log ACTION "SIGKILL ${pid} ($(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-60))"
-      kill -KILL "$pid" 2>/dev/null
-    fi
+    [[ -d "/proc/$pid" ]] && { log ACTION "SIGKILL ${pid}"; kill -KILL "$pid" 2>/dev/null; }
   done
   sleep 1
   clean_display_debris "$d"
   log OK "display :${d} reaped"
 }
 
-# ---------------------------------------------------------------------------
-# self_heal -- the service must be listening, no matter what
-# ---------------------------------------------------------------------------
 self_heal() {
-  local restart=0
+  local restart=0 unit
   if ! ss -lntH 2>/dev/null | grep -q ':3389 '; then
-    log ERROR "nothing is listening on 3389"
-    restart=1
+    log ERROR "nothing is listening on 3389"; restart=1
   fi
   for unit in xrdp xrdp-sesman; do
     if systemctl is-failed --quiet "$unit" 2>/dev/null; then
-      log ERROR "${unit}.service is in a failed state"
-      restart=1
+      log ERROR "${unit}.service is in a failed state"; restart=1
     fi
   done
   if [[ $restart -eq 1 ]]; then
@@ -1392,11 +1439,25 @@ self_heal() {
 }
 
 # ---------------------------------------------------------------------------
-# main
+# --status : human-readable snapshot, changes nothing. Use this to confirm the
+#            reaper agrees with reality before trusting it.
 # ---------------------------------------------------------------------------
+if [[ $STATUS_ONLY -eq 1 ]]; then
+  printf 'xrdp-session-reaper %s - status\n\n' "$REAPER_VERSION"
+  printf '%-9s %s\n' "DISPLAY" "VERDICT"
+  found=0
+  for d in $(discover_displays); do
+    found=1
+    printf '%-9s %s\n' ":${d}" "$(display_verdict "$d")"
+  done
+  [[ $found -eq 0 ]] && printf '(no displays >= :%s)\n' "$DISPLAY_OFFSET"
+  printf '\nlistening on 3389: '
+  ss -lntH 2>/dev/null | grep -q ':3389 ' && printf 'yes\n' || printf 'NO\n'
+  exit 0
+fi
+
 if [[ $CLEANUP_ONLY -eq 1 ]]; then
   log START "boot cleanup (reaper ${REAPER_VERSION}, --cleanup-only)"
-  # At boot nothing legitimate is running, so every socket and lock is stale.
   for s in /tmp/.X11-unix/X*; do
     [[ -e "$s" ]] || continue
     d="${s##*/X}"
@@ -1405,50 +1466,46 @@ if [[ $CLEANUP_ONLY -eq 1 ]]; then
   act "clear stale /tmp/.xrdp sockets" find /tmp/.xrdp -type s -delete
   rm -f /tmp/.X1*-lock 2>/dev/null
   clean_user_debris
+  # Safe only at boot, when no session can be running.
+  for home in /home/*; do
+    [[ -d "${home}/.cache/sessions" ]] && act "clear ${home}/.cache/sessions" rm -rf "${home}/.cache/sessions"
+  done
   rm -rf "${STATE:?}"/* 2>/dev/null
   log OK "boot cleanup finished"
   exit 0
 fi
 
 log START "sweep (reaper ${REAPER_VERSION}, grace=${GRACE_SECONDS}s, dry=${DRY})"
-
-mapfile -t CANDIDATES < <(discover_displays)
-mapfile -t ATTACHED   < <(attached_displays)
-
-if [[ $VERBOSE -eq 1 ]]; then
-  log DEBUG "candidate displays: ${CANDIDATES[*]:-none}"
-  log DEBUG "attached  displays: ${ATTACHED[*]:-none}"
-fi
-
 NOW=$(date +%s)
-for d in "${CANDIDATES[@]:-}"; do
-  [[ -z "$d" ]] && continue
-  is_attached=0
-  for a in "${ATTACHED[@]:-}"; do
-    [[ "$a" == "$d" ]] && { is_attached=1; break; }
-  done
 
-  if [[ $is_attached -eq 1 ]]; then
-    # Live session: clear any pending zombie timestamp.
-    rm -f "${STATE}/${d}.since" 2>/dev/null
-    [[ $VERBOSE -eq 1 ]] && log INFO "display :${d} LIVE (client attached)"
-    continue
-  fi
-
-  # Clientless. Start or check the grace timer.
-  since_file="${STATE}/${d}.since"
-  if [[ ! -f "$since_file" ]]; then
-    echo "$NOW" > "$since_file"
-    log INFO "display :${d} has no client; starting ${GRACE_SECONDS}s grace timer"
-    continue
-  fi
-  since=$(cat "$since_file" 2>/dev/null || echo "$NOW")
-  elapsed=$(( NOW - since ))
-  if [[ $elapsed -lt $GRACE_SECONDS ]]; then
-    log INFO "display :${d} clientless for ${elapsed}s (grace ${GRACE_SECONDS}s)"
-    continue
-  fi
-  reap_display "$d"
+for d in $(discover_displays); do
+  verdict="$(display_verdict "$d")"
+  state="${verdict%% *}"
+  case "$state" in
+    LIVE)
+      rm -f "${STATE}/${d}.since" 2>/dev/null
+      [[ $VERBOSE -eq 1 ]] && log INFO "display :${d} LIVE - ${verdict#* }"
+      ;;
+    EMPTY)
+      log INFO "display :${d} has no X server (${verdict#* }); cleaning debris"
+      clean_display_debris "$d"
+      ;;
+    ORPHAN)
+      since_file="${STATE}/${d}.since"
+      if [[ ! -f "$since_file" ]]; then
+        echo "$NOW" > "$since_file"
+        log INFO "display :${d} ORPHANED (${verdict#* }); starting ${GRACE_SECONDS}s grace timer"
+        continue
+      fi
+      since="$(cat "$since_file" 2>/dev/null || echo "$NOW")"
+      elapsed=$(( NOW - since ))
+      if [[ $elapsed -lt $GRACE_SECONDS ]]; then
+        log INFO "display :${d} orphaned for ${elapsed}s (grace ${GRACE_SECONDS}s)"
+        continue
+      fi
+      reap_display "$d"
+      ;;
+  esac
 done
 
 clean_orphan_sockets
@@ -1653,6 +1710,9 @@ stage_10_verify() {
   check "TLS certificate is readable by xrdp"      sudo -u xrdp test -r /etc/xrdp/key.pem
   check "user '${RDP_USER}' exists"                id -u "$RDP_USER"
   check "startwm.sh is executable"                 test -x /etc/xrdp/startwm.sh
+  if [[ "$TIMEZONE" != "keep" ]]; then
+    check "timezone is ${TIMEZONE}"                 bash -c "[[ \"\$(timedatectl show -p Timezone --value)\" == \"${TIMEZONE}\" ]]"
+  fi
   # REGRESSION GUARD (v1.2.0): ls_logo_filename only exists in the distro
   # xrdp.ini. If it is missing, something hand-wrote the file and the login
   # screen will render as a bare coloured rectangle with no username box.
@@ -1684,7 +1744,8 @@ stage_10_verify() {
   printf '    Username   : %s%s%s\n' "$C_BLD" "$RDP_USER" "$C_RESET"
   printf '    Password   : (the one you just set)\n'
   printf '    Desktop    : %s\n' "${DE_CHOICE^^}"
-  printf '    Browser    : Google Chrome (icon on the desktop)\n\n'
+  printf '    Browser    : Google Chrome (icon on the desktop)\n'
+  printf '    Timezone   : %s  (%s)\n\n' "$(timedatectl show -p Timezone --value 2>/dev/null || echo unknown)" "$(date '+%H:%M %Z')"
   printf '  The first connection shows a certificate warning - that is the\n'
   printf '  self-signed TLS certificate. Accept it.\n\n'
   printf '  Useful commands\n'
@@ -1722,6 +1783,7 @@ parse_args() {
       --force)        FORCE=1 ;;
       --skip-upgrade) SKIP_UPGRADE=1 ;;
       --de=*)         DE_CHOICE="${arg#*=}" ;;
+      --timezone=*)   TIMEZONE="${arg#*=}" ;;
       --version)      echo "ubuntu-rdp-setup.sh ${SCRIPT_VERSION}"; exit 0 ;;
       -h|--help)      usage ;;
       *)              echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
@@ -1741,7 +1803,13 @@ main() {
 
   stage_00_preflight "$@"
 
-  if stage_done "01-update"; then info "Stage 01 already done, skipping (use --force to redo)"; else stage_01_update; fi
+  if stage_done "01-update"; then
+    # Re-run with --skip-upgrade so the timezone block still applies on a resume.
+    info "Stage 01 already done; re-checking timezone only"
+    SKIP_UPGRADE=1 stage_01_update
+  else
+    stage_01_update
+  fi
 
   # Stages 02 and 03 always run interactively if their values are not on disk,
   # because later stages need $DE_CHOICE and $RDP_USER regardless of resume state.

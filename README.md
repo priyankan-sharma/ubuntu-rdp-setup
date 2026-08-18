@@ -6,7 +6,7 @@ One script. Run it once. It updates the system, installs a desktop, installs and
 installs Chrome, creates your login interactively, locks down port 3389, and installs a **zombie-session
 reaper daemon** so XRDP never black-screens on you again.
 
-Current version: **1.2.0**
+Current version: **1.3.0**
 
 ---
 
@@ -86,19 +86,34 @@ client in ~3 minutes rather than ~2 hours, and `Restart=always` drop-ins on `xrd
 
 ### How the reaper decides what to kill
 
-1. Enumerate candidate displays from three independent sources (running `Xorg`/`Xvnc` processes,
-   `/tmp/.X11-unix/X*` sockets, `xrdp-chansrv` argv) — only displays ≥ 10, so `:0` is never touched.
-2. Find which displays have a **real client attached**: every `xrdp` PID holding an ESTABLISHED TCP
-   connection on 3389, mapped to a display via its process tree and environment.
-3. A clientless display starts a **120 s grace timer** (tracked in `/run/xrdp-reaper/`) so a login in
-   progress is never killed.
-4. After the grace period: `SIGTERM` the whole tree → wait 5 s → `SIGKILL` survivors → delete the debris.
+1. Enumerate candidate displays from running `Xorg`/`Xvnc` processes and `/tmp/.X11-unix/X*` sockets —
+   only displays ≥ 10, so `:0` is never touched.
+2. For each display, look at the X server's **parent process**:
+   - parent is a live `xrdp-sesman` → **LIVE**, never touched
+   - parent is PID 1 (reparented to init) → **ORPHAN**, candidate for reaping
+   - no X server at all → **EMPTY**, clean the debris
+3. An orphan must stay orphaned for a **120 s grace period** across consecutive sweeps before it is
+   reaped, so the reaper never races sesman's own teardown.
+4. Then: `SIGTERM` the tree → wait 5 s → `SIGKILL` survivors → delete the debris.
 5. Self-heal: if nothing is listening on 3389, or `xrdp`/`xrdp-sesman` is failed, restart them.
+
+> **Why not detect disconnected clients?** v1.0.0 tried, by mapping ESTABLISHED connections on 3389 to
+> displays. On Ubuntu 24.04 that mapping does not exist — the xrdp connection process has no display in
+> its cmdline, no children, and no `DISPLAY` in its environment — so every live session looked
+> clientless and got killed. Disconnect handling belongs to sesman (`KillDisconnected=true`), which is
+> the mechanism designed for it. The reaper is deliberately conservative and treats anything it does not
+> recognise as live.
 
 Safety rules baked in: never `:0` or any display below 10, never PID 1, and never a process that is not
 owned by a real user (uid ≥ 1000) or the `xrdp` service user.
 
 ### Operating the reaper
+
+Snapshot every display and the reaper's verdict for it (read-only, changes nothing):
+
+```bash
+sudo xrdp-session-reaper --status
+```
 
 ```bash
 sudo xrdp-session-reaper --dry-run --verbose
@@ -112,7 +127,7 @@ tail -f /var/log/xrdp-reaper.log
 systemctl status xrdp-session-reaper.timer
 ```
 
-Options: `--dry-run`, `--verbose`, `--cleanup-only`, `--grace=N`, `--version`, `--help`.
+Options: `--status`, `--dry-run`, `--verbose`, `--cleanup-only`, `--grace=N`, `--version`, `--help`.
 
 ---
 
@@ -153,11 +168,11 @@ file is backed up to `<file>.bak.<epoch>` before being touched, and re-running i
 4. **Pin to a tag** so a future push can never change what your servers run:
 
    ```bash
-   git tag v1.2.0 && git push origin v1.2.0
+   git tag v1.3.0 && git push origin v1.3.0
    ```
 
    ```
-   https://raw.githubusercontent.com/priyankan-sharma/ubuntu-rdp-setup/v1.2.0/ubuntu-rdp-setup.sh
+   https://raw.githubusercontent.com/priyankan-sharma/ubuntu-rdp-setup/v1.3.0/ubuntu-rdp-setup.sh
    ```
 
 Free, versioned, permanent, no account beyond GitHub, no rate limits that matter for this use.
@@ -167,7 +182,7 @@ Free, versioned, permanent, no account beyond GitHub, no rate limits that matter
 Same file, cached at the edge, better for servers far from GitHub:
 
 ```
-https://cdn.jsdelivr.net/gh/priyankan-sharma/ubuntu-rdp-setup@v1.2.0/ubuntu-rdp-setup.sh
+https://cdn.jsdelivr.net/gh/priyankan-sharma/ubuntu-rdp-setup@v1.3.0/ubuntu-rdp-setup.sh
 ```
 
 ### Option C — a real API endpoint (Cloudflare Workers, free tier)
@@ -180,7 +195,7 @@ If you want a short, custom URL like `https://setup.yourname.workers.dev`:
    ```js
    export default {
      async fetch() {
-       const upstream = "https://raw.githubusercontent.com/priyankan-sharma/ubuntu-rdp-setup/v1.2.0/ubuntu-rdp-setup.sh";
+       const upstream = "https://raw.githubusercontent.com/priyankan-sharma/ubuntu-rdp-setup/v1.3.0/ubuntu-rdp-setup.sh";
        const r = await fetch(upstream, { cf: { cacheTtl: 300 } });
        return new Response(r.body, {
          headers: { "content-type": "text/x-shellscript; charset=utf-8" }
@@ -306,6 +321,7 @@ your RDP client at `localhost:3389`.
 | Banned by your own fail2ban | `sudo fail2ban-client set xrdp-sesman-custom unbanip YOUR.IP` |
 | Chrome will not start | Run `google-chrome-rdp` from a terminal in the session and read the error |
 | Login screen is a solid colour with no username box | A pre-1.2.0 bug: `xrdp.ini` was hand-written and lost the `ls_*` login-screen geometry block. Re-run the script (it self-repairs), or `sudo cp /etc/xrdp/xrdp.ini.bak.* /etc/xrdp/xrdp.ini && sudo systemctl restart xrdp` |
+| Desktop dies ~2 min after login, browser closes | A pre-1.3.0 reaper bug — it killed live sessions. Upgrade to v1.3.0, then confirm with `sudo xrdp-session-reaper --status` (must say LIVE) |
 | Everything is broken | Re-run `sudo ./setup.sh --force --skip-upgrade` — it repairs the config in place |
 
 ---

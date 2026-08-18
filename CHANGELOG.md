@@ -5,6 +5,44 @@ comment block in the script header — keep both in sync when releasing.
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Versioning: [SemVer](https://semver.org/).
 
+## [1.3.0] - 2026-08-19
+
+### Fixed
+- **CRITICAL: the reaper was killing live desktop sessions.** Reaper 1.0.0
+  determined whether a client was attached by correlating ESTABLISHED TCP
+  connections on port 3389 back to an X display, through the connection
+  process cmdline, its children, and its environment. Measured on a live,
+  actively-used session on Ubuntu 24.04 / xrdp 0.9.24, all three sources are
+  empty: the connection process has cmdline `/usr/sbin/xrdp`, no children, no
+  `DISPLAY` in environ, and no fds referencing X sockets. `attached_displays()`
+  therefore always returned an empty set, every live session was classified as
+  a zombie, and the reaper killed working desktops 120 seconds after login --
+  taking the browser and unsaved work with it.
+
+### Changed
+- Reaper 1.1.0 determines liveness from the **process tree** instead. A live
+  session has its `Xorg` parented to a per-session `xrdp-sesman`; a genuinely
+  orphaned one is reparented to PID 1. Verified against a live session: the new
+  logic reports `LIVE xpid=55486 parent=xrdp-sesman(55484)` where the old logic
+  reported "no client".
+- **Design rule:** the reaper no longer tries to out-guess sesman about who is
+  connected. Disconnect handling belongs to sesman via `KillDisconnected=true` +
+  `DisconnectedTimeLimit=60`. The reaper now handles only what sesman cannot:
+  orphaned processes, on-disk debris, and a dead listener. It is deliberately
+  conservative -- an unknown parent process is treated as live, because a missed
+  zombie costs one manual cleanup while a wrongly-killed session costs the user
+  their work.
+- `startwm.sh` no longer deletes `~/.cache/sessions` on every login. It prevented
+  a rare stale-session black screen at the cost of making desktop session
+  restore permanently impossible. That cleanup now runs only at boot, from
+  `xrdp-boot-cleanup.service`, where no session can be live.
+- Dropped the pointless `GNOME_SHELL_SESSION_MODE` export from `~/.xsessionrc`.
+
+### Added
+- `xrdp-session-reaper --status`: a read-only snapshot printing every display
+  and its verdict (LIVE / ORPHAN / EMPTY) with the parent process that justified
+  it. Run this to confirm the reaper agrees with reality before trusting it.
+
 ## [1.2.0] - 2026-08-19
 
 ### Fixed
