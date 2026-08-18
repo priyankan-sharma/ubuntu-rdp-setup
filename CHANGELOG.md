@@ -5,6 +5,25 @@ comment block in the script header — keep both in sync when releasing.
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Versioning: [SemVer](https://semver.org/).
 
+## [1.5.0] - 2026-08-19
+
+### Fixed
+- **"Untrusted application launcher" dialog on every click of the Chrome desktop
+  icon.** The script made the `.desktop` file executable and user-owned, which is
+  not sufficient on XFCE 4.18 (the version in Ubuntu 24.04). xfdesktop also
+  requires a gio metadata attribute, `metadata::xfce-exe-checksum`, containing
+  the SHA-256 of the file. Observed on a real install: the file was already
+  `0755` and owned by the user, and the prompt still appeared on every launch.
+
+### Added
+- `trust_desktop_file()`, which sets all three things a desktop file needs to be
+  launched without a prompt: the executable bit, `metadata::xfce-exe-checksum`
+  (XFCE), and `metadata::trusted` (GNOME/Nautilus). It runs `gio` as the target
+  user, since metadata lives in `~/.local/share/gvfs-metadata`.
+- `gvfs` and `gvfs-backends` to the package list — `gio` metadata is a no-op
+  without them.
+- A stage 10 check asserting the Chrome icon carries the checksum attribute.
+
 ## [1.4.0] - 2026-08-19
 
 ### Fixed

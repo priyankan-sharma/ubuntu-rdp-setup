@@ -4,7 +4,7 @@
 #  One-shot installer: Ubuntu 24.04 LTS server  ->  RDP-accessible desktop
 #                                                   with Google Chrome.
 # =============================================================================
-#  SCRIPT_VERSION : 1.4.0
+#  SCRIPT_VERSION : 1.5.0
 #  TARGET OS      : Ubuntu 24.04 LTS (noble), amd64 or arm64
 #  TARGET HW      : VPS, 1-4 vCPU / 1-16 GB RAM
 #  LICENSE        : MIT
@@ -73,6 +73,15 @@
 # =============================================================================
 #  CHANGELOG
 # -----------------------------------------------------------------------------
+#  1.5.0  FIX: "Untrusted application launcher" prompt on the Chrome icon.
+#         XFCE 4.18 (Ubuntu 24.04) does not trust a .desktop file just because
+#         it is executable - it also requires a gio metadata attribute,
+#         metadata::xfce-exe-checksum, holding the file's SHA-256. Observed on a
+#         real install: file was 0755 and user-owned, prompt still appeared.
+#         New trust_desktop_file() sets the exec bit, the XFCE checksum and the
+#         GNOME metadata::trusted flag. Added gvfs (which backs gio metadata) to
+#         the package list and a verification check.
+#
 #  1.4.0  FIX: Indian-language text rendered as empty boxes ("tofu").
 #         A server image ships Latin fonts only - measured on a fresh install,
 #         fc-list :lang=hi returned 0, so google.com's own language footer was
@@ -144,7 +153,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.5.0"
 readonly STATE_DIR="/var/lib/xrdp-setup"
 readonly STATE_FILE="${STATE_DIR}/state"
 readonly LOG_FILE="/var/log/xrdp-setup.log"
@@ -609,7 +618,8 @@ stage_04_install_de() {
 
   # Common bits every DE needs under XRDP.
   local common=(xorg xserver-xorg-core dbus-x11 x11-xserver-utils x11-utils
-                policykit-1-gnome desktop-file-utils xdg-utils fontconfig)
+                policykit-1-gnome desktop-file-utils xdg-utils fontconfig
+                gvfs gvfs-backends)
 
   # ---------------------------------------------------------------------------
   # Fonts.
@@ -1062,6 +1072,51 @@ SESMANOVERRIDE
 #  --disable-gpu / --disable-dev-shm-usage matter because a VPS has no GPU and a
 #  small /dev/shm, which otherwise produces blank tabs and renderer crashes.
 # =============================================================================
+# -----------------------------------------------------------------------------
+# trust_desktop_file <path-to-.desktop>
+#
+#  WHY THIS EXISTS: dropping a .desktop file on the desktop is not enough. Every
+#  modern desktop refuses to launch one it does not trust, and shows
+#      "Untrusted application launcher - the desktop file is in an insecure
+#       location and not marked as executable"
+#  on every single double-click. Making it executable does NOT silence this on
+#  XFCE 4.18+ (the version in Ubuntu 24.04): xfdesktop additionally requires a
+#  gio metadata attribute, metadata::xfce-exe-checksum, holding the SHA-256 of
+#  the file. Observed on a real install: the file was already 0755 and
+#  user-owned, and the prompt still appeared, because that attribute was unset.
+#
+#  So all three things are needed:
+#    1. the executable bit
+#    2. metadata::xfce-exe-checksum = sha256 of the file   (XFCE)
+#    3. metadata::trusted = true                           (GNOME/Nautilus)
+#
+#  gio writes to ~/.local/share/gvfs-metadata, so it must run AS the user. It
+#  works without a live session as long as XDG_RUNTIME_DIR points somewhere the
+#  user can write. Failure here is cosmetic, never fatal.
+# -----------------------------------------------------------------------------
+trust_desktop_file() {
+  local file="$1" sum uid
+  [[ -f "$file" ]] || return 0
+  [[ $DRY_RUN -eq 1 ]] && { printf '%s[dry-run]%s would trust %s\n' "$C_YLW" "$C_RESET" "$file"; return 0; }
+
+  chmod 0755 "$file" 2>/dev/null || true
+  chown "${RDP_USER}:${RDP_USER}" "$file" 2>/dev/null || true
+
+  command -v gio >/dev/null 2>&1 || { warn "gio not found; ${file##*/} may prompt on first launch"; return 0; }
+
+  sum="$(sha256sum "$file" | cut -d" " -f1)"
+  uid="$(id -u "$RDP_USER")"
+  install -d -o "$RDP_USER" -g "$RDP_USER" -m 0700 "/run/user/${uid}" 2>/dev/null || true
+
+  sudo -u "$RDP_USER" XDG_RUNTIME_DIR="/run/user/${uid}" \
+       gio set -t string "$file" metadata::xfce-exe-checksum "$sum" 2>/dev/null \
+    || warn "could not set metadata::xfce-exe-checksum on ${file##*/}"
+  sudo -u "$RDP_USER" XDG_RUNTIME_DIR="/run/user/${uid}" \
+       gio set -t string "$file" metadata::trusted true 2>/dev/null || true
+
+  _log TRUST "${file} sha256=${sum}"
+}
+
 stage_07_install_chrome() {
   CURRENT_STAGE="07-install-chrome"
   step "Stage 07/10 - Installing Google Chrome"
@@ -1157,8 +1212,8 @@ MIMEAPPS
     mkdir -p "${home}/Desktop"
     if [[ -f /usr/share/applications/google-chrome.desktop ]]; then
       cp /usr/share/applications/google-chrome.desktop "${home}/Desktop/" || true
-      chmod +x "${home}/Desktop/google-chrome.desktop" || true
       chown "${RDP_USER}:${RDP_USER}" "${home}/Desktop/google-chrome.desktop" || true
+      trust_desktop_file "${home}/Desktop/google-chrome.desktop"
     fi
     chown "${RDP_USER}:${RDP_USER}" "${home}/Desktop"
   fi
@@ -1738,6 +1793,11 @@ stage_10_verify() {
   check "TLS certificate is readable by xrdp"      sudo -u xrdp test -r /etc/xrdp/key.pem
   check "user '${RDP_USER}' exists"                id -u "$RDP_USER"
   check "startwm.sh is executable"                 test -x /etc/xrdp/startwm.sh
+  # If this attribute is missing, XFCE shows "Untrusted application launcher"
+  # on every double-click of the Chrome icon.
+  if [[ -f "$(getent passwd "$RDP_USER" | cut -d: -f6)/Desktop/google-chrome.desktop" ]]; then
+    check "Chrome desktop icon is trusted"         bash -c "sudo -u ${RDP_USER} XDG_RUNTIME_DIR=/run/user/\$(id -u ${RDP_USER}) gio info -a metadata::xfce-exe-checksum \"$(getent passwd "$RDP_USER" | cut -d: -f6)/Desktop/google-chrome.desktop\" 2>/dev/null | grep -q xfce-exe-checksum"
+  fi
   # Font coverage: 0 here means every Indic page renders as empty boxes.
   check "Devanagari fonts present"                 bash -c "[[ \$(fc-list :lang=hi | wc -l) -gt 0 ]]"
   check "Tamil fonts present"                      bash -c "[[ \$(fc-list :lang=ta | wc -l) -gt 0 ]]"

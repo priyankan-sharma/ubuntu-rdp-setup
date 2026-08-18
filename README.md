@@ -6,7 +6,7 @@ One script. Run it once. It updates the system, installs a desktop, installs and
 installs Chrome, creates your login interactively, locks down port 3389, and installs a **zombie-session
 reaper daemon** so XRDP never black-screens on you again.
 
-Current version: **1.4.0**
+Current version: **1.5.0**
 
 ---
 
@@ -168,11 +168,11 @@ file is backed up to `<file>.bak.<epoch>` before being touched, and re-running i
 4. **Pin to a tag** so a future push can never change what your servers run:
 
    ```bash
-   git tag v1.4.0 && git push origin v1.4.0
+   git tag v1.5.0 && git push origin v1.5.0
    ```
 
    ```
-   https://raw.githubusercontent.com/priyankan-sharma/ubuntu-rdp-setup/v1.4.0/ubuntu-rdp-setup.sh
+   https://raw.githubusercontent.com/priyankan-sharma/ubuntu-rdp-setup/v1.5.0/ubuntu-rdp-setup.sh
    ```
 
 Free, versioned, permanent, no account beyond GitHub, no rate limits that matter for this use.
@@ -182,7 +182,7 @@ Free, versioned, permanent, no account beyond GitHub, no rate limits that matter
 Same file, cached at the edge, better for servers far from GitHub:
 
 ```
-https://cdn.jsdelivr.net/gh/priyankan-sharma/ubuntu-rdp-setup@v1.4.0/ubuntu-rdp-setup.sh
+https://cdn.jsdelivr.net/gh/priyankan-sharma/ubuntu-rdp-setup@v1.5.0/ubuntu-rdp-setup.sh
 ```
 
 ### Option C — a real API endpoint (Cloudflare Workers, free tier)
@@ -195,7 +195,7 @@ If you want a short, custom URL like `https://setup.yourname.workers.dev`:
    ```js
    export default {
      async fetch() {
-       const upstream = "https://raw.githubusercontent.com/priyankan-sharma/ubuntu-rdp-setup/v1.4.0/ubuntu-rdp-setup.sh";
+       const upstream = "https://raw.githubusercontent.com/priyankan-sharma/ubuntu-rdp-setup/v1.5.0/ubuntu-rdp-setup.sh";
        const r = await fetch(upstream, { cf: { cacheTtl: 300 } });
        return new Response(r.body, {
          headers: { "content-type": "text/x-shellscript; charset=utf-8" }
@@ -321,6 +321,7 @@ your RDP client at `localhost:3389`.
 | Banned by your own fail2ban | `sudo fail2ban-client set xrdp-sesman-custom unbanip YOUR.IP` |
 | Text shows as empty boxes (tofu) | Missing fonts. `fc-list :lang=hi \| wc -l` should be > 0; if it is 0, `sudo apt install -y fonts-indic fonts-noto-core fonts-noto-color-emoji && sudo fc-cache -f`, then restart Chrome |
 | Chinese/Japanese/Korean shows as tofu | Not installed by default (~250 MB): `sudo apt install -y fonts-noto-cjk && sudo fc-cache -f` |
+| "Untrusted application launcher" on the Chrome icon | XFCE needs a checksum attribute, not just the exec bit: `F=~/Desktop/google-chrome.desktop; gio set -t string "$F" metadata::xfce-exe-checksum "$(sha256sum "$F" \| cut -d" " -f1)"` |
 | Chrome will not start | Run `google-chrome-rdp` from a terminal in the session and read the error |
 | Login screen is a solid colour with no username box | A pre-1.2.0 bug: `xrdp.ini` was hand-written and lost the `ls_*` login-screen geometry block. Re-run the script (it self-repairs), or `sudo cp /etc/xrdp/xrdp.ini.bak.* /etc/xrdp/xrdp.ini && sudo systemctl restart xrdp` |
 | Desktop dies ~2 min after login, browser closes | A pre-1.3.0 reaper bug — it killed live sessions. Upgrade to v1.3.0, then confirm with `sudo xrdp-session-reaper --status` (must say LIVE) |
