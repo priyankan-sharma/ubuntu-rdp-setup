@@ -6,7 +6,7 @@ One script. Run it once. It updates the system, installs a desktop, installs and
 installs Chrome, creates your login interactively, locks down port 3389, and installs a **zombie-session
 reaper daemon** so XRDP never black-screens on you again.
 
-Current version: **1.1.0**
+Current version: **1.2.0**
 
 ---
 
@@ -40,7 +40,7 @@ Then connect with any RDP client:
 | 03 | **Interactively prompts** for the RDP username and password |
 | 04 | Installs XFCE, MATE, or GNOME Flashback (Xorg — never Wayland) |
 | 05 | Installs `xrdp` + `xorgxrdp` |
-| 06 | The fail-proof XRDP config (TLS, sesman policy, `startwm.sh`, polkit, sysctl, systemd drop-ins) |
+| 06 | The fail-proof XRDP config — `xrdp.ini`/`sesman.ini` patched in place, plus `startwm.sh`, polkit, sysctl, systemd drop-ins |
 | 07 | Google Chrome from the official apt repo, plus a VPS-tuned launcher wrapper |
 | 08 | **The zombie-session reaper** — systemd timer (60 s) + boot-time cleanup unit |
 | 09 | UFW (SSH + RDP open, everything else denied), fail2ban jail for XRDP brute force |
@@ -153,11 +153,11 @@ file is backed up to `<file>.bak.<epoch>` before being touched, and re-running i
 4. **Pin to a tag** so a future push can never change what your servers run:
 
    ```bash
-   git tag v1.1.0 && git push origin v1.1.0
+   git tag v1.2.0 && git push origin v1.2.0
    ```
 
    ```
-   https://raw.githubusercontent.com/priyankan-sharma/ubuntu-rdp-setup/v1.1.0/ubuntu-rdp-setup.sh
+   https://raw.githubusercontent.com/priyankan-sharma/ubuntu-rdp-setup/v1.2.0/ubuntu-rdp-setup.sh
    ```
 
 Free, versioned, permanent, no account beyond GitHub, no rate limits that matter for this use.
@@ -167,7 +167,7 @@ Free, versioned, permanent, no account beyond GitHub, no rate limits that matter
 Same file, cached at the edge, better for servers far from GitHub:
 
 ```
-https://cdn.jsdelivr.net/gh/priyankan-sharma/ubuntu-rdp-setup@v1.1.0/ubuntu-rdp-setup.sh
+https://cdn.jsdelivr.net/gh/priyankan-sharma/ubuntu-rdp-setup@v1.2.0/ubuntu-rdp-setup.sh
 ```
 
 ### Option C — a real API endpoint (Cloudflare Workers, free tier)
@@ -180,7 +180,7 @@ If you want a short, custom URL like `https://setup.yourname.workers.dev`:
    ```js
    export default {
      async fetch() {
-       const upstream = "https://raw.githubusercontent.com/priyankan-sharma/ubuntu-rdp-setup/v1.1.0/ubuntu-rdp-setup.sh";
+       const upstream = "https://raw.githubusercontent.com/priyankan-sharma/ubuntu-rdp-setup/v1.2.0/ubuntu-rdp-setup.sh";
        const r = await fetch(upstream, { cf: { cacheTtl: 300 } });
        return new Response(r.body, {
          headers: { "content-type": "text/x-shellscript; charset=utf-8" }
@@ -292,6 +292,10 @@ your RDP client at `localhost:3389`.
 
 ---
 
+> **Never hand-write `/etc/xrdp/xrdp.ini`.** Since v1.2.0 the script patches it key by key and leaves
+> the `ls_*` login-screen geometry block, bitmap and font references untouched. Replacing the file
+> wholesale produces a login screen that paints its background and nothing else.
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -301,6 +305,7 @@ your RDP client at `localhost:3389`.
 | Cannot connect at all | `sudo ss -lntp \| grep 3389`, `sudo ufw status`, `sudo systemctl status xrdp` |
 | Banned by your own fail2ban | `sudo fail2ban-client set xrdp-sesman-custom unbanip YOUR.IP` |
 | Chrome will not start | Run `google-chrome-rdp` from a terminal in the session and read the error |
+| Login screen is a solid colour with no username box | A pre-1.2.0 bug: `xrdp.ini` was hand-written and lost the `ls_*` login-screen geometry block. Re-run the script (it self-repairs), or `sudo cp /etc/xrdp/xrdp.ini.bak.* /etc/xrdp/xrdp.ini && sudo systemctl restart xrdp` |
 | Everything is broken | Re-run `sudo ./setup.sh --force --skip-upgrade` — it repairs the config in place |
 
 ---

@@ -4,7 +4,7 @@
 #  One-shot installer: Ubuntu 24.04 LTS server  ->  RDP-accessible desktop
 #                                                   with Google Chrome.
 # =============================================================================
-#  SCRIPT_VERSION : 1.1.0
+#  SCRIPT_VERSION : 1.2.0
 #  TARGET OS      : Ubuntu 24.04 LTS (noble), amd64 or arm64
 #  TARGET HW      : VPS, 1-4 vCPU / 1-16 GB RAM
 #  LICENSE        : MIT
@@ -71,6 +71,24 @@
 # =============================================================================
 #  CHANGELOG
 # -----------------------------------------------------------------------------
+#  1.2.0  FIX: blue/blank login screen with no username-password box.
+#         Cause: 1.0.0-1.1.0 wrote /etc/xrdp/xrdp.ini from scratch and defined
+#         only two ls_* keys (ls_title, ls_top_window_bg_color). xrdp draws its
+#         login window from a COMPLETE block of ls_* geometry keys; a partial
+#         set makes it take the custom-login-screen path with zero widget
+#         geometry, so the background paints but no widgets do. The hand-written
+#         file also dropped the bitmap/font resource references.
+#         Fix: xrdp.ini and sesman.ini are now PATCHED IN PLACE key by key via
+#         an ini_set() helper, never replaced. Added restore_distro_ini(), which
+#         detects a hand-written file from an older version and restores the
+#         pristine one from the oldest backup or straight out of the .deb.
+#         Added two verification checks that fail if the distro login-screen
+#         block is missing.
+#         UPGRADING from 1.0.0/1.1.0: just re-run the script; it repairs
+#         xrdp.ini automatically. Or restore by hand:
+#           sudo cp /etc/xrdp/xrdp.ini.bak.* /etc/xrdp/xrdp.ini
+#           sudo systemctl restart xrdp
+#
 #  1.1.0  Firewall simplification.
 #         - Removed the "restrict RDP to a source IP/CIDR" prompt; port 3389 is
 #           now opened to any address. Rationale: the operator connects from
@@ -96,7 +114,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly STATE_DIR="/var/lib/xrdp-setup"
 readonly STATE_FILE="${STATE_DIR}/state"
 readonly LOG_FILE="/var/log/xrdp-setup.log"
@@ -621,137 +639,154 @@ stage_06_configure_xrdp() {
   run chmod 644 "$cert"
 
   # ---------------------------------------------------------------------------
-  # 6.2  xrdp.ini
+  # 6.2  xrdp.ini and sesman.ini - PATCHED IN PLACE, NEVER REPLACED
+  #
+  #  HARD-WON LESSON (v1.2.0). Version 1.1.0 wrote a complete xrdp.ini from
+  #  scratch. That produced a login screen showing ONLY the background colour
+  #  with no username/password box - the "blue screen" bug.
+  #
+  #  Why: xrdp draws its login window from a COMPLETE block of ls_* geometry
+  #  keys in [Globals] - ls_width, ls_height, ls_label_x, ls_input_x,
+  #  ls_btn_ok_x/y/width/height, ls_logo_filename and roughly a dozen more.
+  #  Define some of them and xrdp takes the custom-login-screen code path with
+  #  zero widget geometry: the background paints, the widgets do not. The stock
+  #  Ubuntu file ships the whole block, and it also references bitmap and font
+  #  resources under /usr/share/xrdp that a hand-written file silently drops.
+  #
+  #  So: patch the distro file key by key and leave everything else alone. Never
+  #  hand-roll xrdp.ini. The same rule applies to sesman.ini.
   # ---------------------------------------------------------------------------
-  write_file /etc/xrdp/xrdp.ini 0644 <<'XRDPINI'
-; /etc/xrdp/xrdp.ini  -- managed by ubuntu-rdp-setup.sh
-; Each non-default value carries a reason. Do not "tidy" them away.
 
-[Globals]
-ini_version=1
+  # If a previous version installed a hand-written file, put the distro one back
+  # before patching, otherwise we would be patching the broken file.
+  restore_distro_ini() {
+    local target="$1" oldest
+    grep -q 'managed by ubuntu-rdp-setup.sh' "$target" 2>/dev/null || return 0
+    warn "$(basename "$target") was hand-written by an older version; restoring the distro copy"
+    # Oldest backup == the pristine one taken on the very first run.
+    oldest="$(ls -1t "${target}".bak.* 2>/dev/null | tail -1 || true)"
+    if [[ -n "$oldest" && -s "$oldest" ]] \
+       && ! grep -q 'managed by ubuntu-rdp-setup.sh' "$oldest"; then
+      run cp -f "$oldest" "$target"
+      ok "restored $(basename "$target") from $(basename "$oldest")"
+      return 0
+    fi
+    # No usable backup: extract the file straight out of the .deb.
+    warn "no pristine backup found; extracting $(basename "$target") from the xrdp package"
+    if [[ $DRY_RUN -eq 0 ]]; then
+      local tmpd; tmpd="$(mktemp -d)"
+      ( cd "$tmpd" \
+        && apt-get download xrdp >/dev/null 2>&1 \
+        && dpkg-deb --fsys-tarfile xrdp_*.deb \
+             | tar -xO "./etc/xrdp/$(basename "$target")" > "${tmpd}/ini" 2>/dev/null ) || true
+      if [[ -s "${tmpd}/ini" ]]; then
+        cp -f "${tmpd}/ini" "$target"
+        ok "extracted a pristine $(basename "$target") from the package"
+      else
+        err "Could not obtain a pristine $(basename "$target")."
+        err "Fix by hand:  sudo apt-get install --reinstall -o Dpkg::Options::=--force-confmiss xrdp"
+      fi
+      rm -rf "$tmpd"
+    fi
+  }
 
-fork=true
-port=3389
-use_vsock=false
+  # ini_set <file> <section> <key> <value>
+  # Sets key=value inside [section], replacing an existing (or commented-out)
+  # entry in place and preserving every other line, comment and blank line.
+  ini_set() {
+    local file="$1" section="$2" key="$3" value="$4" tmp rc=0
+    [[ -f "$file" ]] || { warn "ini_set: ${file} does not exist"; return 0; }
+    if [[ $DRY_RUN -eq 1 ]]; then
+      printf '%s[dry-run]%s %s [%s] %s=%s\n' "$C_YLW" "$C_RESET" "$(basename "$file")" "$section" "$key" "$value"
+      return 0
+    fi
+    tmp="$(mktemp)"
+    # No dynamic regexes here: section and key are compared as plain strings,
+    # so a key or section containing regex metacharacters cannot break the edit.
+    awk -v sec="$section" -v k="$key" -v v="$value" '
+      function trim(x) { gsub(/^[ \t]+|[ \t]+$/, "", x); return x }
+      BEGIN { insec = 0; done = 0; seen = 0 }
+      {
+        line = trim($0)
+        # ---- section header ----
+        if (substr(line, 1, 1) == "[") {
+          if (insec && !done) { print k "=" v; done = 1 }
+          insec = (line == "[" sec "]")
+          if (insec) seen = 1
+          print; next
+        }
+        # ---- candidate key line, possibly commented out ----
+        if (insec) {
+          bare = line
+          sub(/^[#;][ \t]*/, "", bare)          # tolerate ;key= and #key=
+          eq = index(bare, "=")
+          if (eq > 0 && trim(substr(bare, 1, eq - 1)) == k) {
+            if (!done) { print k "=" v; done = 1 }
+            next
+          }
+        }
+        print
+      }
+      END {
+        if (insec && !done) print k "=" v
+        else if (!seen) exit 3
+      }
+    ' "$file" > "$tmp" || rc=$?
+    if [[ $rc -eq 3 ]]; then
+      warn "ini_set: section [${section}] not found in ${file}; ${key} not set"
+      rm -f "$tmp"; return 0
+    fi
+    if ! cmp -s "$tmp" "$file"; then
+      [[ -f "${file}${BACKUP_SUFFIX}" ]] || cp -a "$file" "${file}${BACKUP_SUFFIX}"
+      cat "$tmp" > "$file"
+      _log INI "${file} [${section}] ${key}=${value}"
+    fi
+    rm -f "$tmp"
+  }
 
-; TLS only. RDP-level "negotiate" lets old clients drop to the broken
-; standard-RDP crypto path, which some Windows builds then refuse.
-security_layer=tls
-crypt_level=high
-certificate=/etc/xrdp/cert.pem
-key_file=/etc/xrdp/key.pem
-ssl_protocols=TLSv1.2, TLSv1.3
-tls_ciphers=HIGH
+  restore_distro_ini /etc/xrdp/xrdp.ini
+  restore_distro_ini /etc/xrdp/sesman.ini
 
-; 24bpp is the sweet spot for a browsing session: 32bpp roughly doubles
-; bandwidth for no visible gain over a WAN.
-max_bpp=24
-new_cursors=true
-use_fastpath=both
-
-; tcp_nodelay  -> kills the 40ms Nagle stutter on mouse/keyboard input.
-; tcp_keepalive-> makes the kernel notice a dead client instead of leaving a
-;                 half-open socket that keeps a zombie session "alive".
-tcp_nodelay=true
-tcp_keepalive=true
-tcp_send_buffer_bytes=4194304
-tcp_recv_buffer_bytes=4194304
-
-; Cosmetic login window.
-bitmap_cache=true
-bitmap_compression=true
-allow_channels=true
-allow_multimon=true
-autorun=Xorg
-hidelogwindow=true
-require_credentials=false
-enable_token_login=false
-blue=009fb4
-grey=dedede
-ls_title=Remote Desktop
-ls_top_window_bg_color=009fb4
-
-[Logging]
-LogFile=/var/log/xrdp.log
-LogLevel=INFO
-EnableSyslog=true
-
-[Channels]
-rdpdr=true
-rdpsnd=true
-drdynvc=true
-cliprdr=true
-rail=false
-xrdpvr=false
-tcutils=false
-
-; ONE session type only. Extra entries (vnc-any, neutrinordp, console) confuse
-; the login combo box and let a user pick a path we have not configured.
-[Xorg]
-name=Remote Desktop
-lib=libxup.so
-username=ask
-password=ask
-ip=127.0.0.1
-port=-1
-code=20
-XRDPINI
+  info "Patching /etc/xrdp/xrdp.ini ..."
+  # TLS only: "negotiate" lets old clients drop to the broken standard-RDP
+  # crypto path, which some Windows builds then refuse outright.
+  ini_set /etc/xrdp/xrdp.ini Globals security_layer  tls
+  ini_set /etc/xrdp/xrdp.ini Globals crypt_level     high
+  ini_set /etc/xrdp/xrdp.ini Globals certificate     /etc/xrdp/cert.pem
+  ini_set /etc/xrdp/xrdp.ini Globals key_file        /etc/xrdp/key.pem
+  ini_set /etc/xrdp/xrdp.ini Globals ssl_protocols   "TLSv1.2, TLSv1.3"
+  # 24bpp is the sweet spot for browsing: 32bpp roughly doubles bandwidth for no
+  # visible gain over a WAN.
+  ini_set /etc/xrdp/xrdp.ini Globals max_bpp         24
+  ini_set /etc/xrdp/xrdp.ini Globals new_cursors     true
+  # tcp_nodelay  -> kills the 40ms Nagle stutter on mouse/keyboard input.
+  # tcp_keepalive-> makes the kernel notice a dead client instead of leaving a
+  #                 half-open socket that keeps a zombie session "alive".
+  ini_set /etc/xrdp/xrdp.ini Globals tcp_nodelay     true
+  ini_set /etc/xrdp/xrdp.ini Globals tcp_keepalive   true
+  # NOTE: deliberately NOT touched - ls_*, hidelogwindow, bitmap/font paths,
+  # and the [Xorg]/[Xvnc] session blocks. See the lesson at the top of 6.2.
 
   # ---------------------------------------------------------------------------
   # 6.3  sesman.ini - the anti-zombie policy layer (L1)
   # ---------------------------------------------------------------------------
-  write_file /etc/xrdp/sesman.ini 0644 <<'SESMANINI'
-; /etc/xrdp/sesman.ini  -- managed by ubuntu-rdp-setup.sh
-; This file is layer 1 of the anti-zombie strategy.
-
-[Globals]
-ListenAddress=127.0.0.1
-ListenPort=3350
-EnableUserWindowManager=true
-UserWindowManager=startwm.sh
-DefaultWindowManager=startwm.sh
-ReconnectScript=reconnectwm.sh
-
-[Security]
-AllowRootLogin=false
-MaxLoginRetry=4
-TerminalServerUsers=tsusers
-TerminalServerAdmins=tsadmins
-AlwaysGroupCheck=false
-RestrictOutboundClipboard=none
-RestrictInboundClipboard=none
-
-[Sessions]
-; ---------------------------------------------------------------------------
-; Policy=UBDI  -> a session is keyed on User + Bpp + Display + IP address.
-;   Why: with the default policy, reconnecting from a different client/IP can
-;   attach you to a session whose X server is already half-dead, which is
-;   exactly the black-screen symptom. UBDI makes a genuinely new connection
-;   get a genuinely new session, and the reaper then cleans up the old one.
-; ---------------------------------------------------------------------------
-Policy=UBDI
-
-X11DisplayOffset=10
-MaxSessions=10
-
-; KillDisconnected=true + DisconnectedTimeLimit -> sesman tears a session down
-; itself 60s after the client vanishes. This is the fast path; the reaper is
-; the backstop for the cases where sesman never notices (hard network drops).
-KillDisconnected=true
-DisconnectedTimeLimit=60
-
-; 0 = never kill an idle-but-connected session. You do not want your browser
-; session killed because you went to lunch.
-IdleTimeLimit=0
-
-[Logging]
-LogFile=/var/log/xrdp-sesman.log
-LogLevel=INFO
-EnableSyslog=true
-
-[SessionVariables]
-PULSE_SCRIPT=/etc/xrdp/pulse/default.pa
-SESMANINI
+  info "Patching /etc/xrdp/sesman.ini ..."
+  # Policy=UBDI -> a session is keyed on User + Bpp + Display + IP address.
+  #   With the default policy, reconnecting from a different client or IP can
+  #   attach you to a session whose X server is already half-dead - exactly the
+  #   black-screen symptom. UBDI makes a genuinely new connection get a
+  #   genuinely new session, and the reaper then cleans up the old one.
+  ini_set /etc/xrdp/sesman.ini Sessions Policy                 UBDI
+  # sesman tears a session down itself 60s after the client vanishes. This is
+  # the fast path; the reaper is the backstop for hard drops sesman misses.
+  ini_set /etc/xrdp/sesman.ini Sessions KillDisconnected       true
+  ini_set /etc/xrdp/sesman.ini Sessions DisconnectedTimeLimit  60
+  # 0 = never kill an idle-but-connected session. You do not want your browser
+  # session killed because you went to lunch.
+  ini_set /etc/xrdp/sesman.ini Sessions IdleTimeLimit          0
+  ini_set /etc/xrdp/sesman.ini Sessions MaxSessions            10
+  ini_set /etc/xrdp/sesman.ini Security AllowRootLogin         false
+  ini_set /etc/xrdp/sesman.ini Security MaxLoginRetry          4
 
   # ---------------------------------------------------------------------------
   # 6.4  startwm.sh - the anti-instant-close layer (L2)
@@ -1618,6 +1653,11 @@ stage_10_verify() {
   check "TLS certificate is readable by xrdp"      sudo -u xrdp test -r /etc/xrdp/key.pem
   check "user '${RDP_USER}' exists"                id -u "$RDP_USER"
   check "startwm.sh is executable"                 test -x /etc/xrdp/startwm.sh
+  # REGRESSION GUARD (v1.2.0): ls_logo_filename only exists in the distro
+  # xrdp.ini. If it is missing, something hand-wrote the file and the login
+  # screen will render as a bare coloured rectangle with no username box.
+  check "xrdp.ini login-screen block intact"       grep -q '^ls_logo_filename' /etc/xrdp/xrdp.ini
+  check "xrdp.ini has session geometry keys"       grep -q '^ls_width' /etc/xrdp/xrdp.ini
   if [[ "$(dpkg --print-architecture)" == "amd64" ]]; then
     check "Google Chrome is installed"             test -x /usr/bin/google-chrome-stable
   fi

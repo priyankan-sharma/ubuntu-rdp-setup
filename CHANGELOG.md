@@ -5,6 +5,39 @@ comment block in the script header — keep both in sync when releasing.
 
 Format: [Keep a Changelog](https://keepachangelog.com/). Versioning: [SemVer](https://semver.org/).
 
+## [1.2.0] - 2026-08-19
+
+### Fixed
+- **Login screen rendered as a solid coloured rectangle with no username or
+  password box.** Versions 1.0.0-1.1.0 wrote `/etc/xrdp/xrdp.ini` from scratch
+  and defined only two `ls_*` keys (`ls_title`, `ls_top_window_bg_color`). xrdp
+  draws its login window from a *complete* block of `ls_*` geometry keys
+  (`ls_width`, `ls_height`, `ls_label_x`, `ls_input_x`, `ls_btn_ok_*`,
+  `ls_logo_filename`, and more). A partial set sends xrdp down the
+  custom-login-screen code path with zero widget geometry: the background paints
+  and the widgets do not. The hand-written file also silently dropped the
+  bitmap and font resource references under `/usr/share/xrdp`.
+
+### Changed
+- `xrdp.ini` and `sesman.ini` are now **patched in place**, key by key, via a new
+  `ini_set()` helper (awk-based, plain string matching, no dynamic regexes). It
+  replaces existing or commented-out entries in place and preserves every other
+  line, comment and blank line. Verified idempotent.
+- Added `restore_distro_ini()`: detects a hand-written config left by 1.0.0 or
+  1.1.0 and restores the pristine file from the oldest timestamped backup, or
+  extracts it from the `xrdp` `.deb` if no backup survives.
+- Removed all login-screen cosmetic customization. The distro login screen is
+  left completely untouched.
+
+### Added
+- Two verification checks in stage 10 that fail if `ls_logo_filename` or
+  `ls_width` is missing from `xrdp.ini` — a regression guard for exactly this
+  bug.
+
+### Upgrading
+Re-run the script; it repairs `xrdp.ini` automatically. To fix by hand instead:
+`sudo cp /etc/xrdp/xrdp.ini.bak.* /etc/xrdp/xrdp.ini && sudo systemctl restart xrdp`
+
 ## [1.1.0] - 2026-08-18
 
 ### Changed
